@@ -5,7 +5,7 @@
   "description": "Desktop control center for Codex ChatGPT Web",
   "author": "miuuyy",
   "type": "module",
-  "main": "electron/main.cjs",
+  "main": "electron/main-resilient.cjs",
   "scripts": {
     "dev": "bun run scripts/dev.cjs",
     "typecheck": "tsc --noEmit",
