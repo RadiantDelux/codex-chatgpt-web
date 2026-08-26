@@ -1,0 +1,71 @@
+name: Tunnel 502 Recovery
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/tunnel-502-recovery
+    paths:
+      - "launcher/electron/runtime-supervisor*.cjs"
+      - "launcher/electron/main-resilient.cjs"
+      - "launcher/tests/tunnel-resilience.test.cjs"
+      - "launcher/package.json"
+      - ".github/workflows/tunnel-502-recovery.yml"
+  pull_request:
+    paths:
+      - "launcher/electron/runtime-supervisor*.cjs"
+      - "launcher/electron/main-resilient.cjs"
+      - "launcher/tests/tunnel-resilience.test.cjs"
+      - "launcher/package.json"
+      - ".github/workflows/tunnel-502-recovery.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tunnel-502-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tunnel-resilience:
+    name: Tunnel resilience (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-15
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - name: Install root dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install launcher dependencies
+        run: bun install --frozen-lockfile
+        working-directory: launcher
+
+      - name: Run focused tunnel resilience tests
+        run: node --test tests/tunnel-resilience.test.cjs
+        working-directory: launcher
+
+      - name: Run complete launcher test suite
+        run: bun run test
+        working-directory: launcher
+
+      - name: Typecheck launcher
+        run: bun run typecheck
+        working-directory: launcher
+
+      - name: Build launcher renderer
+        run: bun run build:renderer
+        working-directory: launcher
