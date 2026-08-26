@@ -1,5 +1,3 @@
-const MCP_STDIO_SEND_INITIALIZED_NOTIFICATION = "true";
-
 function controlPlaneProxyHealthFromInventory(output, alias) {
   if (typeof output !== "string" || !output.trim()) {
     return { statusKnown: false, healthy: undefined, state: undefined };
@@ -15,7 +13,9 @@ function controlPlaneProxyHealthFromInventory(output, alias) {
       return { statusKnown: false, healthy: undefined, state: undefined };
     }
     const controlPlane = summaries.find(summary => summary?.route?.kind === "control_plane");
-    const state = typeof controlPlane?.state === "string" ? controlPlane.state : undefined;
+    const state = typeof controlPlane?.health_state === "string"
+      ? controlPlane.health_state
+      : undefined;
     if (!state || state === "unknown") {
       return { statusKnown: false, healthy: undefined, state };
     }
@@ -36,26 +36,10 @@ function installTunnelResiliencePatch(RuntimeSupervisor) {
   const prototype = RuntimeSupervisor.prototype;
   if (prototype.__tunnelResiliencePatched) return;
 
-  const originalRunTunnelCommand = prototype.runTunnelCommand;
   const originalObserveTunnelForMonitor = prototype.observeTunnelForMonitor;
-  if (typeof originalRunTunnelCommand !== "function"
-    || typeof originalObserveTunnelForMonitor !== "function") {
-    throw new Error("RuntimeSupervisor tunnel methods are unavailable");
+  if (typeof originalObserveTunnelForMonitor !== "function") {
+    throw new Error("RuntimeSupervisor tunnel monitor method is unavailable");
   }
-
-  prototype.runTunnelCommand = function patchedRunTunnelCommand(config, args, ...rest) {
-    if (!Array.isArray(args) || args[0] !== "runtimes" || args[1] !== "connect") {
-      return originalRunTunnelCommand.call(this, config, args, ...rest);
-    }
-    const previous = process.env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION;
-    process.env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION = MCP_STDIO_SEND_INITIALIZED_NOTIFICATION;
-    try {
-      return originalRunTunnelCommand.call(this, config, args, ...rest);
-    } finally {
-      if (previous === undefined) delete process.env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION;
-      else process.env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION = previous;
-    }
-  };
 
   prototype.observeTunnelForMonitor = async function patchedObserveTunnelForMonitor(config) {
     const local = await this.readLocalTunnelHealth();
@@ -98,7 +82,6 @@ function installTunnelResiliencePatch(RuntimeSupervisor) {
 }
 
 module.exports = {
-  MCP_STDIO_SEND_INITIALIZED_NOTIFICATION,
   controlPlaneProxyHealthFromInventory,
   installTunnelResiliencePatch,
 };
