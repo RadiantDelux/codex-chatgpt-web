@@ -1,0 +1,99 @@
+name: Tunnel 502 Recovery
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/tunnel-502-recovery
+    paths:
+      - "launcher/**"
+      - "src/**"
+      - "scripts/**"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/tunnel-502-recovery.yml"
+  pull_request:
+    paths:
+      - "launcher/**"
+      - "src/**"
+      - "scripts/**"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/tunnel-502-recovery.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tunnel-502-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-launcher:
+    name: Build launcher (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-15
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - name: Install root dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install launcher dependencies
+        run: bun install --frozen-lockfile
+        working-directory: launcher
+
+      - name: Prepare AVX2-independent Windows runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.0 -Revision 1.4.0+34cbb9a40 -GitHubEnv $env:GITHUB_ENV
+
+      - name: Run focused tunnel resilience tests
+        run: node --test tests/tunnel-resilience.test.cjs
+        working-directory: launcher
+
+      - name: Run complete launcher test suite
+        run: bun run test
+        working-directory: launcher
+
+      - name: Package launcher
+        run: bun run app:package
+
+      - name: Ensure virtual display is available
+        if: runner.os == 'Linux'
+        run: command -v xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
+
+      - name: Smoke test packaged launcher
+        run: bun run app:smoke
+
+      - name: Show packaged files
+        shell: bash
+        run: |
+          echo "Packaged files:"
+          find launcher/artifacts -maxdepth 1 -type f -print
+
+      - name: Upload executable artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-web-gpt-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            launcher/artifacts/*.exe
+            launcher/artifacts/*.AppImage
+            launcher/artifacts/*.dmg
+            launcher/artifacts/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

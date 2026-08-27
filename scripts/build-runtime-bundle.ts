@@ -68,8 +68,21 @@ if (!build.success) {
   throw new Error(`Runtime bundle failed: ${build.logs.map(log => log.message).join("; ")}`);
 }
 
+const tunnelUpgradeBuild = await Bun.build({
+  entrypoints: [join(root, "src", "tunnel-upgrade-main.ts")],
+  target: "bun",
+  minify: true,
+  external: ["playwright-core"],
+  packages: "external",
+  outdir: appDir,
+  naming: "tunnel-upgrade.js",
+});
+if (!tunnelUpgradeBuild.success) {
+  throw new Error(`Tunnel updater bundle failed: ${tunnelUpgradeBuild.logs.map(log => log.message).join("; ")}`);
+}
+
 const browserHelperBuild = await Bun.build({
-  entrypoints: [join(root, "src", "adapters", "chatgpt-web", "browser-helper-main.ts")],
+  entrypoints: [join(root, "src", "adapters", "chatgpt-web", "browser-helper-resilient-main.ts")],
   target: "node",
   format: "cjs",
   minify: true,
@@ -128,7 +141,7 @@ if (process.platform !== "win32") chmodSync(join(binDir, launcherName), 0o755);
 
 const playwrightPackage = join(appDir, "node_modules", "playwright-core", "package.json");
 const bundleId = createHash("sha256");
-for (const relativePath of ["app/cli.js", "app/browser-helper.cjs", "app/package.json", "app/bun.lock", `runtime/${bunName}`]) {
+for (const relativePath of ["app/cli.js", "app/tunnel-upgrade.js", "app/browser-helper.cjs", "app/package.json", "app/bun.lock", `runtime/${bunName}`]) {
   bundleId.update(relativePath);
   bundleId.update("\0");
   bundleId.update(readFileSync(join(output, relativePath)));

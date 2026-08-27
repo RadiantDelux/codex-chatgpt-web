@@ -1,12 +1,36 @@
 import { describe, expect, test } from "bun:test";
-import { TUNNEL_VERSION, parseTunnelStatus, tunnelClientInstallAction, tunnelCommandOutput, tunnelConnectLaunchError } from "../src/tunnel";
+import {
+  TUNNEL_MCP_CONNECTION_MAX_TTL,
+  TUNNEL_MCP_STDIO_SEND_INITIALIZED_NOTIFICATION,
+  TUNNEL_VERSION,
+  parseTunnelStatus,
+  tunnelClientInstallAction,
+  tunnelCommandOutput,
+  tunnelConnectLaunchError,
+  tunnelRuntimeEnvironment,
+} from "../src/tunnel";
 
-test("pins the fixed tunnel-client and migrates only the previously shipped version", () => {
-  expect(TUNNEL_VERSION).toBe("0.0.12");
-  expect(tunnelClientInstallAction("0.0.12")).toBe("reuse");
+test("pins the fixed tunnel-client and migrates previously shipped versions", () => {
+  expect(TUNNEL_VERSION).toBe("0.0.13");
+  expect(tunnelClientInstallAction("0.0.13")).toBe("reuse");
+  expect(tunnelClientInstallAction("0.0.12")).toBe("upgrade");
   expect(tunnelClientInstallAction("0.0.10")).toBe("upgrade");
   expect(() => tunnelClientInstallAction("0.0.11")).toThrow("not a trusted upgrade source");
   expect(() => tunnelClientInstallAction("9.9.9")).toThrow("not a trusted upgrade source");
+});
+
+test("managed tunnel launches force the stable stdio compatibility environment", () => {
+  expect(TUNNEL_MCP_CONNECTION_MAX_TTL).toBe("24h");
+  expect(TUNNEL_MCP_STDIO_SEND_INITIALIZED_NOTIFICATION).toBe("true");
+  expect(tunnelRuntimeEnvironment({
+    PATH: "/tmp/bin",
+    MCP_CONNECTION_MAX_TTL: "1m",
+    MCP_STDIO_SEND_INITIALIZED_NOTIFICATION: "false",
+  })).toEqual({
+    PATH: "/tmp/bin",
+    MCP_CONNECTION_MAX_TTL: "24h",
+    MCP_STDIO_SEND_INITIALIZED_NOTIFICATION: "true",
+  });
 });
 
 describe("tunnel status boundary", () => {

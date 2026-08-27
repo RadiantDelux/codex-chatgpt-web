@@ -6,13 +6,24 @@ import type { AppConfig, TunnelConfig } from "./config";
 import { atomicWriteFile, getConfigDir, stripUtf8Bom } from "./config";
 import { runCommand, runChecked } from "./process";
 
-export const TUNNEL_VERSION = "0.0.12";
-const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10"]);
+export const TUNNEL_VERSION = "0.0.13";
+const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10", "0.0.12"]);
 const RELEASE_BASE = `https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_VERSION}`;
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 export const TUNNEL_READY_TIMEOUT_MS = 120_000;
 export const TUNNEL_MCP_CONNECTION_MAX_TTL = "24h";
+export const TUNNEL_MCP_STDIO_SEND_INITIALIZED_NOTIFICATION = "true";
 const TUNNEL_STATUS_POLL_INTERVAL_MS = 1_000;
+
+export function tunnelRuntimeEnvironment(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    ...baseEnv,
+    MCP_CONNECTION_MAX_TTL: TUNNEL_MCP_CONNECTION_MAX_TTL,
+    MCP_STDIO_SEND_INITIALIZED_NOTIFICATION: TUNNEL_MCP_STDIO_SEND_INITIALIZED_NOTIFICATION,
+  };
+}
 
 interface TunnelInstallManifest {
   version: 1;
@@ -237,7 +248,10 @@ export function connectTunnel(config: AppConfig): void {
     "--runtime-api-key", `file:${settings.runtimeKeyFile}`,
     "--mcp-command", mcpCommand(config),
     "--json",
-  ], { timeout: TUNNEL_READY_TIMEOUT_MS });
+  ], {
+    timeout: TUNNEL_READY_TIMEOUT_MS,
+    env: tunnelRuntimeEnvironment(),
+  });
   const structuredOutput = result.stdout.trim();
   const launchError = structuredOutput
     ? tunnelConnectLaunchError(structuredOutput)
