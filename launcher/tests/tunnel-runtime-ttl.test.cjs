@@ -29,3 +29,12 @@ test("managed tunnel commands extend the MCP transport lifetime", async () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("resilient launcher forces tunnel-client stdio lifecycle compatibility", () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, "..", "electron", "main-resilient.cjs"),
+    "utf8",
+  );
+  assert.match(source, /MCP_STDIO_SEND_INITIALIZED_NOTIFICATION\s*=\s*"true"/);
+  assert.match(source, /MCP_CONNECTION_MAX_TTL\s*=\s*"24h"/);
+});
