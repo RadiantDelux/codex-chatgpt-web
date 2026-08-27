@@ -6,6 +6,7 @@ const {
   controlPlaneProxyHealthFromInventory,
   liveTunnelVersionFromInventory,
   mainMcpChannelHealthFromInventory,
+  tunnelClientVersionFromOutput,
   installTunnelResiliencePatch,
 } = require("../electron/runtime-supervisor-tunnel-resilience.cjs");
 
@@ -68,6 +69,14 @@ test("live inventory exposes the exact tunnel-client runtime version", () => {
     liveTunnelVersionFromInventory(JSON.stringify({ entries: [] }), "codex-chatgpt-web").statusKnown,
     false,
   );
+});
+
+test("installed tunnel-client version is parsed from the binary version output", () => {
+  assert.deepEqual(
+    tunnelClientVersionFromOutput("tunnel-client version 0.0.12\n"),
+    { statusKnown: true, version: "0.0.12" },
+  );
+  assert.equal(tunnelClientVersionFromOutput("unknown build").statusKnown, false);
 });
 
 test("MCP inventory reports a terminal failed stdio probe", () => {
@@ -208,12 +217,15 @@ test("monitor overrides green local probes when the main MCP stdio probe failed"
   assert.match(result.detail, /mcp_main=failed/);
 });
 
-test("start replaces an explicitly stale live tunnel-client before adoption", async () => {
+test("start stops and upgrades an explicitly stale tunnel-client before adoption", async () => {
   class FakeSupervisor {
     constructor() {
       this.calls = [];
       this.tunnel = { pid: 1234 };
-      this.logger = { warn: (...args) => this.calls.push(["warn", ...args]) };
+      this.logger = {
+        warn: (...args) => this.calls.push(["warn", ...args]),
+        info: (...args) => this.calls.push(["info", ...args]),
+      };
     }
 
     async readLocalTunnelHealth() {
@@ -228,7 +240,11 @@ test("start replaces an explicitly stale live tunnel-client before adoption", as
       this.calls.push("original-start");
     }
 
-    async runTunnelCommand() {
+    async runTunnelCommand(_config, args) {
+      if (args[0] === "--version") {
+        this.calls.push("binary-version-probe");
+        return { code: 0, output: "tunnel-client version 0.0.12" };
+      }
       this.calls.push("version-probe");
       return { code: 0, output: inventory("healthy", undefined, "0.0.12") };
     }
@@ -245,28 +261,42 @@ test("start replaces an explicitly stale live tunnel-client before adoption", as
     async waitForTunnelStopped() {
       this.calls.push("wait-stopped");
     }
+
+    async runTunnelClientUpgrade() {
+      this.calls.push("upgrade-client");
+      return { version: "0.0.13" };
+    }
   }
 
   installTunnelResiliencePatch(FakeSupervisor);
   const supervisor = new FakeSupervisor();
   await supervisor.startTunnel({
     mode: "full",
-    tunnel: { alias: "codex-chatgpt-web" },
+    tunnel: { alias: "codex-chatgpt-web", binaryPath: "/tmp/tunnel-client" },
   });
 
   assert.equal(supervisor.tunnel, null);
-  assert.ok(supervisor.calls.indexOf("stop-runtime") < supervisor.calls.indexOf("original-start"));
+  assert.ok(supervisor.calls.indexOf("stop-runtime") < supervisor.calls.indexOf("upgrade-client"));
+  assert.ok(supervisor.calls.indexOf("upgrade-client") < supervisor.calls.indexOf("original-start"));
   assert.deepEqual(
     supervisor.calls.filter(call => typeof call === "string"),
-    ["version-probe", "stop-monitor", "stop-runtime", "wait-stopped", "original-start"],
+    [
+      "version-probe",
+      "binary-version-probe",
+      "stop-monitor",
+      "stop-runtime",
+      "wait-stopped",
+      "upgrade-client",
+      "original-start",
+    ],
   );
 });
 
-test("start does not stop a matching live tunnel-client", async () => {
+test("start does not stop or upgrade a matching live tunnel-client", async () => {
   class FakeSupervisor {
     constructor() {
       this.calls = [];
-      this.logger = { warn() {} };
+      this.logger = { warn() {}, info() {} };
     }
 
     async readLocalTunnelHealth() {
@@ -281,7 +311,11 @@ test("start does not stop a matching live tunnel-client", async () => {
       this.calls.push("original-start");
     }
 
-    async runTunnelCommand() {
+    async runTunnelCommand(_config, args) {
+      if (args[0] === "--version") {
+        this.calls.push("binary-version-probe");
+        return { code: 0, output: "tunnel-client version 0.0.13" };
+      }
       this.calls.push("version-probe");
       return { code: 0, output: inventory("healthy") };
     }
@@ -290,16 +324,21 @@ test("start does not stop a matching live tunnel-client", async () => {
       this.calls.push("stop-runtime");
       return { code: 0, output: "{}" };
     }
+
+    async runTunnelClientUpgrade() {
+      this.calls.push("upgrade-client");
+      return { version: "0.0.13" };
+    }
   }
 
   installTunnelResiliencePatch(FakeSupervisor);
   const supervisor = new FakeSupervisor();
   await supervisor.startTunnel({
     mode: "full",
-    tunnel: { alias: "codex-chatgpt-web" },
+    tunnel: { alias: "codex-chatgpt-web", binaryPath: "/tmp/tunnel-client" },
   });
 
-  assert.deepEqual(supervisor.calls, ["version-probe", "original-start"]);
+  assert.deepEqual(supervisor.calls, ["version-probe", "binary-version-probe", "original-start"]);
 });
 
 test("monitor preserves green local state when control plane and MCP channel are healthy", async () => {
