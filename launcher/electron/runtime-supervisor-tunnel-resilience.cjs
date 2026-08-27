@@ -1,4 +1,10 @@
+const path = require("node:path");
+const { spawn } = require("node:child_process");
+const { tunnelUpgradeInvocation } = require("./runtime-command.cjs");
+
 const EXPECTED_TUNNEL_CLIENT_VERSION = "0.0.13";
+const TUNNEL_UPGRADE_TIMEOUT_MS = 120_000;
+const MAX_TUNNEL_UPGRADE_OUTPUT_CHARS = 1024 * 1024;
 
 function parsedInventoryEntry(output, alias) {
   if (typeof output !== "string" || !output.trim()) return undefined;
@@ -66,13 +72,120 @@ function liveTunnelVersionFromInventory(output, alias) {
   return { statusKnown: true, version };
 }
 
-function staleRuntimeStopError(result) {
-  const output = typeof result?.output === "string" ? result.output : "";
-  const safeOutput = output
+function tunnelClientVersionFromOutput(output) {
+  const match = String(output || "").match(/\b(\d+\.\d+\.\d+)\b/);
+  return match
+    ? { statusKnown: true, version: match[1] }
+    : { statusKnown: false, version: undefined };
+}
+
+function redactTunnelDiagnostic(value, maxChars = 500) {
+  return String(value || "")
     .replace(/tunnel_[a-f0-9]{32}/g, "[tunnel-id]")
     .replace(/sk-[A-Za-z0-9_-]{12,}/g, "[redacted-key]")
-    .slice(0, 500);
+    .slice(0, maxChars);
+}
+
+function tunnelRuntimeAbsentOutput(value) {
+  return /not found|not running|unknown alias|\balias\b[^\r\n]{0,160}\bis not known\b/i.test(
+    String(value || ""),
+  );
+}
+
+function staleRuntimeStopError(result) {
+  const safeOutput = redactTunnelDiagnostic(result?.output);
   return `failed to stop stale tunnel-client runtime${safeOutput ? `: ${safeOutput}` : ""}`;
+}
+
+function pathIdentity(value, platform = process.platform) {
+  const normalized = platform === "win32" ? path.win32.resolve(value) : path.resolve(value);
+  return platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function appendBoundedOutput(current, chunk) {
+  const next = current + chunk.toString("utf8");
+  return next.length <= MAX_TUNNEL_UPGRADE_OUTPUT_CHARS
+    ? next
+    : next.slice(-MAX_TUNNEL_UPGRADE_OUTPUT_CHARS);
+}
+
+function runControlInvocation(invocation, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    const child = spawn(invocation.executable, invocation.args, {
+      cwd: invocation.cwd,
+      env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutMs);
+    child.stdout.on("data", chunk => {
+      stdout = appendBoundedOutput(stdout, chunk);
+    });
+    child.stderr.on("data", chunk => {
+      stderr = appendBoundedOutput(stderr, chunk);
+    });
+    child.once("error", error => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`${label} failed to start: ${error instanceof Error ? error.message : String(error)}`));
+    });
+    child.once("close", code => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+        return;
+      }
+      resolve({ code: Number.isInteger(code) ? code : 1, stdout, stderr });
+    });
+  });
+}
+
+async function runTunnelClientUpgrade(supervisor, config) {
+  if (supervisor.runtimeRootProvider) {
+    supervisor.installedRuntimeRoot = supervisor.runtimeRootProvider();
+  }
+  const invocation = tunnelUpgradeInvocation({
+    app: supervisor.app,
+    sourceRoot: supervisor.sourceRoot,
+    installedRuntimeRoot: supervisor.installedRuntimeRoot,
+  });
+  const result = await runControlInvocation(
+    invocation,
+    TUNNEL_UPGRADE_TIMEOUT_MS,
+    "Tunnel client updater",
+  );
+  if (result.code !== 0) {
+    const detail = redactTunnelDiagnostic(result.stderr || result.stdout, 1_000);
+    throw new Error(`Tunnel client updater failed${detail ? `: ${detail}` : ""}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(result.stdout.trim());
+  } catch {
+    throw new Error(
+      `Tunnel client updater returned invalid output: ${redactTunnelDiagnostic(result.stdout || "[empty]")}`,
+    );
+  }
+  if (parsed?.version !== EXPECTED_TUNNEL_CLIENT_VERSION) {
+    throw new Error(
+      `Tunnel client updater installed unexpected version ${String(parsed?.version || "unknown")}`,
+    );
+  }
+  if (typeof parsed?.executable !== "string"
+    || pathIdentity(parsed.executable) !== pathIdentity(config.tunnel.binaryPath)) {
+    throw new Error("Tunnel client updater target does not match the configured tunnel binary");
+  }
+  return parsed;
 }
 
 function installTunnelResiliencePatch(RuntimeSupervisor) {
@@ -150,6 +263,7 @@ function installTunnelResiliencePatch(RuntimeSupervisor) {
   if (typeof originalStartTunnel === "function") {
     prototype.startTunnel = async function patchedStartTunnel(config, ...args) {
       let liveVersion;
+      let installedVersion;
       if (config?.mode === "full" && config?.tunnel?.alias) {
         try {
           const inventory = await this.runTunnelCommand(
@@ -166,22 +280,53 @@ function installTunnelResiliencePatch(RuntimeSupervisor) {
             message: error instanceof Error ? error.message : String(error),
           });
         }
+        try {
+          const binaryVersion = await this.runTunnelCommand(
+            config,
+            ["--version"],
+            10_000,
+            "Tunnel client binary version probe",
+          );
+          if (binaryVersion?.code === 0) {
+            installedVersion = tunnelClientVersionFromOutput(binaryVersion.output);
+          }
+        } catch (error) {
+          this.logger?.warn?.("runtime.tunnel_binary_version_probe_unavailable", {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
 
-      if (liveVersion?.statusKnown && liveVersion.version !== EXPECTED_TUNNEL_CLIENT_VERSION) {
+      const liveMismatch = liveVersion?.statusKnown
+        && liveVersion.version !== EXPECTED_TUNNEL_CLIENT_VERSION;
+      const installedMismatch = installedVersion?.statusKnown
+        && installedVersion.version !== EXPECTED_TUNNEL_CLIENT_VERSION;
+      if (liveMismatch || installedMismatch) {
         this.logger?.warn?.("runtime.tunnel_version_mismatch", {
-          liveVersion: liveVersion.version,
+          liveVersion: liveVersion?.version,
+          installedVersion: installedVersion?.version,
           expectedVersion: EXPECTED_TUNNEL_CLIENT_VERSION,
         });
         this.stopTunnelMonitor?.();
         const stopped = await this.runTunnelStopCommand(config);
-        if (stopped?.code !== 0) {
+        if (stopped?.code !== 0 && !tunnelRuntimeAbsentOutput(stopped?.output)) {
           throw new Error(staleRuntimeStopError(stopped));
         }
-        if (typeof this.waitForTunnelStopped === "function") {
+        if (stopped?.code === 0 && typeof this.waitForTunnelStopped === "function") {
           await this.waitForTunnelStopped(config);
         }
         this.tunnel = null;
+
+        const shouldUpgradeBinary = installedMismatch
+          || (liveMismatch && !installedVersion?.statusKnown);
+        if (shouldUpgradeBinary) {
+          const upgraded = typeof this.runTunnelClientUpgrade === "function"
+            ? await this.runTunnelClientUpgrade(config)
+            : await runTunnelClientUpgrade(this, config);
+          this.logger?.info?.("runtime.tunnel_client_upgraded", {
+            version: upgraded?.version ?? EXPECTED_TUNNEL_CLIENT_VERSION,
+          });
+        }
       }
 
       return await originalStartTunnel.call(this, config, ...args);
@@ -201,5 +346,6 @@ module.exports = {
   controlPlaneProxyHealthFromInventory,
   liveTunnelVersionFromInventory,
   mainMcpChannelHealthFromInventory,
+  tunnelClientVersionFromOutput,
   installTunnelResiliencePatch,
 };
