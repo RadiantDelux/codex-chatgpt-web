@@ -29,6 +29,42 @@ function controlPlaneProxyHealthFromInventory(output, alias) {
   }
 }
 
+function mainMcpChannelHealthFromInventory(output, alias) {
+  if (typeof output !== "string" || !output.trim()) {
+    return { statusKnown: false, healthy: undefined, state: undefined, reason: undefined };
+  }
+  try {
+    const parsed = JSON.parse(output);
+    if (!Array.isArray(parsed.entries)) {
+      return { statusKnown: false, healthy: undefined, state: undefined, reason: undefined };
+    }
+    const entry = parsed.entries.find(candidate => candidate?.alias === alias);
+    const channels = entry?.live_runtime?.status?.channels;
+    if (!Array.isArray(channels)) {
+      return { statusKnown: false, healthy: undefined, state: undefined, reason: undefined };
+    }
+    const main = channels.find(channel => channel?.name === "main");
+    if (!main || main.transport_kind !== "stdio") {
+      return { statusKnown: false, healthy: undefined, state: undefined, reason: undefined };
+    }
+    const state = typeof main.probe_status === "string" ? main.probe_status : undefined;
+    const reason = typeof main.reason === "string" ? main.reason : undefined;
+
+    // tunnel-client marks the channel disabled when the initial MCP probe fails. Treat only that
+    // terminal state as unhealthy; pending/timeout/auth-required remain fail-open because they can
+    // recover without restarting the managed runtime.
+    if (state === "failed" || (main.enabled === false && reason === "initial mcp probe failed")) {
+      return { statusKnown: true, healthy: false, state: state ?? "failed", reason };
+    }
+    if (main.enabled === true && state === "ok") {
+      return { statusKnown: true, healthy: true, state, reason };
+    }
+    return { statusKnown: false, healthy: undefined, state, reason };
+  } catch {
+    return { statusKnown: false, healthy: undefined, state: undefined, reason: undefined };
+  }
+}
+
 function installTunnelResiliencePatch(RuntimeSupervisor) {
   if (!RuntimeSupervisor?.prototype) {
     throw new TypeError("RuntimeSupervisor class is required");
@@ -53,20 +89,36 @@ function installTunnelResiliencePatch(RuntimeSupervisor) {
         config,
         ["runtimes", "cleanup", "--json"],
         5_000,
-        "Tunnel control-plane health probe",
+        "Tunnel deep health probe",
       );
       if (inventory?.code !== 0) return local;
-      const health = controlPlaneProxyHealthFromInventory(inventory.output, config?.tunnel?.alias);
-      if (!health.statusKnown || health.healthy) return local;
-      return {
-        ...local,
-        ready: false,
-        healthy: false,
-        state: "degraded",
-        detail: `${local.detail}; control_plane=${health.state}`,
-      };
+
+      const alias = config?.tunnel?.alias;
+      const proxyHealth = controlPlaneProxyHealthFromInventory(inventory.output, alias);
+      if (proxyHealth.statusKnown && !proxyHealth.healthy) {
+        return {
+          ...local,
+          ready: false,
+          healthy: false,
+          state: "degraded",
+          detail: `${local.detail}; control_plane=${proxyHealth.state}`,
+        };
+      }
+
+      const mcpHealth = mainMcpChannelHealthFromInventory(inventory.output, alias);
+      if (mcpHealth.statusKnown && !mcpHealth.healthy) {
+        return {
+          ...local,
+          ready: false,
+          healthy: false,
+          state: "degraded",
+          detail: `${local.detail}; mcp_main=${mcpHealth.state}${mcpHealth.reason ? ` (${mcpHealth.reason})` : ""}`,
+        };
+      }
+
+      return local;
     } catch (error) {
-      this.logger?.warn?.("runtime.tunnel_control_plane_probe_unavailable", {
+      this.logger?.warn?.("runtime.tunnel_deep_probe_unavailable", {
         message: error instanceof Error ? error.message : String(error),
       });
       return local;
@@ -83,5 +135,6 @@ function installTunnelResiliencePatch(RuntimeSupervisor) {
 
 module.exports = {
   controlPlaneProxyHealthFromInventory,
+  mainMcpChannelHealthFromInventory,
   installTunnelResiliencePatch,
 };
